@@ -5,7 +5,7 @@ import json
 from machine import Pin, Timer
 import bluetooth
 from micropython import const
-from config import *
+from config import WIFI_SSID, WIFI_PASSWORD, QINGPING_MAC, RUUVI_MAC
 
 # LED setup
 led = Pin("LED", Pin.OUT)
@@ -14,9 +14,8 @@ led_state = False
 # BLE Scanner setup
 _IRQ_SCAN_RESULT = const(5)
 _IRQ_SCAN_DONE = const(6)
-
-# Ruuvi tag settings
-RUUVI_DATA_FORMAT = 5  # Ruuvi uses data format 5
+_QINGPING_UUID = const(0xFDCD)
+_RUUVI_COMPANY_ID = const(0x0499)
 
 # HTTP server settings
 HTTP_PORT = 8000
@@ -33,7 +32,7 @@ timer.init(period=1000, mode=Timer.PERIODIC, callback=blink_timer)
 
 # Add a second timer for BLE scanning
 ble_timer = Timer()
-global_scanner = None  # Global variable to store scanner instance
+global_scanner = None
 
 class BLEScanner:
     def __init__(self):
@@ -41,61 +40,137 @@ class BLEScanner:
         self.ble = bluetooth.BLE()
         self.ble.active(True)
         self.ble.irq(self.ble_irq)
-        self.latest_data = None
+        self.qingping_data = None
+        self.ruuvi_data = None
+        self.last_qingping_update = 0
+        self.last_ruuvi_update = 0
+        self.devices_seen_this_scan = set()  # Track devices seen during current scan
         print("BLE Scanner initialized and active")
         
     def ble_irq(self, event, data):
         if event == _IRQ_SCAN_RESULT:
             addr_type, addr, adv_type, rssi, adv_data = data
-            addr = ':'.join(['%02x' % i for i in addr])
-            if addr.lower() == RUUVI_MAC.lower():
-                print(f"Found Ruuvi tag! Raw data: {adv_data.hex()}")
-                self.parse_ruuvi_data(adv_data)
-                # Change to fast blinking when data received
+            addr_str = ':'.join(['%02x' % i for i in addr])
+            
+            # Skip if we've already seen this device in this scan
+            if addr_str in self.devices_seen_this_scan:
+                return
+            
+            if addr_str == QINGPING_MAC:
+                self.devices_seen_this_scan.add(addr_str)  # Mark as seen
+                self.parse_qingping_data(adv_data)
+                print("Qingping data updated:", self.qingping_data)
                 timer.init(period=500, mode=Timer.PERIODIC, callback=blink_timer)
+            
+            elif addr_str == RUUVI_MAC:
+                self.devices_seen_this_scan.add(addr_str)  # Mark as seen
+                self.parse_ruuvi_data(adv_data)
+                print("Ruuvi data updated:", self.ruuvi_data)
+                timer.init(period=500, mode=Timer.PERIODIC, callback=blink_timer)
+                
         elif event == _IRQ_SCAN_DONE:
             print("Scan complete")
-            # Return to normal blinking after scan
+            self.devices_seen_this_scan.clear()  # Clear the set for next scan
             timer.init(period=1000, mode=Timer.PERIODIC, callback=blink_timer)
     
-    def parse_ruuvi_data(self, data):
-        print(f"Parsing data: {data.hex()}")
-        try:
-            # Looking for Ruuvi manufacturer data
-            i = 0
-            while i < len(data):
-                length = data[i]
-                if i + 1 < len(data):
-                    type_id = data[i + 1]
-                    if type_id == 0xFF:  # Manufacturer Specific Data
-                        mfg_data = data[i + 2:i + length + 1]
-                        if mfg_data[0:2] == b'\x99\x04':  # Ruuvi manufacturer ID
-                            print("Found Ruuvi manufacturer data")
-                            if mfg_data[2] == RUUVI_DATA_FORMAT:
-                                print("Found data format 5")
-                                # Format 5 parsing
-                                temp = int.from_bytes(mfg_data[3:5], 'big') * 0.005
-                                # Convert to signed value if necessary
-                                if temp > 32767:
-                                    temp -= 65536
-                                humidity = int.from_bytes(mfg_data[5:7], 'big') * 0.0025
-                                pressure = int.from_bytes(mfg_data[7:9], 'big') + 50000
-                                
-                                self.latest_data = {
-                                    'temperature': temp,
-                                    'humidity': humidity,
-                                    'pressure': pressure / 100
-                                }
-                                print(f"Parsed data: {self.latest_data}")
-                                return
-                i += length + 1
-            print("No Ruuvi data found in packet")
-        except Exception as e:
-            print(f"Error parsing data: {e}")
+    def parse_qingping_data(self, adv_data):
+        i = 0
+        while i < len(adv_data):
+            length = adv_data[i]
+            if i + 1 < len(adv_data):
+                type_id = adv_data[i + 1]
+                if type_id == 0x16:  # Service Data
+                    service_uuid = int.from_bytes(adv_data[i + 2:i + 4], 'little')
+                    if service_uuid == _QINGPING_UUID:
+                        service_data = adv_data[i + 4:i + length + 1]
+                        if len(service_data) >= 14:
+                            temp_raw = int.from_bytes(service_data[10:12], 'little')
+                            temp = temp_raw / 10.0
+                            
+                            hum_raw = int.from_bytes(service_data[12:14], 'little')
+                            humidity = hum_raw / 10.0
+                            
+                            self.qingping_data = {
+                                'temperature': temp,
+                                'humidity': humidity
+                            }
+                            return
+            i += length + 1
+
+    def parse_ruuvi_data(self, adv_data):
+        i = 0
+        while i < len(adv_data):
+            length = adv_data[i]
+            if i + 1 < len(adv_data):
+                type_id = adv_data[i + 1]
+                if type_id == 0xFF:  # Manufacturer Data
+                    company_id = int.from_bytes(adv_data[i + 2:i + 4], 'little')
+                    if company_id == _RUUVI_COMPANY_ID:
+                        mfg_data = adv_data[i + 2:i + length + 1]
+                        if len(mfg_data) > 2 and mfg_data[2] == 0x05:  # Data format 5
+                            temp_raw = int.from_bytes(mfg_data[3:5], 'big', True)
+                            temp = temp_raw * 0.005
+                            
+                            hum_raw = int.from_bytes(mfg_data[5:7], 'big')
+                            humidity = hum_raw * 0.0025
+                            
+                            pressure_raw = int.from_bytes(mfg_data[7:9], 'big')
+                            pressure = (pressure_raw + 50000) / 100
+                            
+                            self.ruuvi_data = {
+                                'temperature': round(temp, 2),
+                                'humidity': round(humidity, 2),
+                                'pressure': round(pressure, 2)
+                            }
+                            return
+            i += length + 1
     
     def start_scan(self):
         print("Starting BLE scan...")
         self.ble.gap_scan(10000, 30000, 30000)
+
+def start_webserver(ip, scanner):
+    print("Starting web server...")
+    addr = socket.getaddrinfo(ip, HTTP_PORT)[0][-1]
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    
+    try:
+        s.bind(addr)
+        s.listen(1)
+        print(f'Listening on http://{ip}:{HTTP_PORT}')
+        
+        while True:
+            try:
+                cl, addr = s.accept()
+                request = cl.recv(1024).decode()
+                
+                response = None
+                if 'GET /1' in request:  # Qingping endpoint
+                    response = scanner.qingping_data
+                elif 'GET /2' in request:  # Ruuvi endpoint
+                    response = scanner.ruuvi_data
+                
+                if response:
+                    response_json = json.dumps(response)
+                    response_str = f'HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(response_json)}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{response_json}'
+                else:
+                    response_str = 'HTTP/1.0 404 Not Found\r\n\r\n'
+                
+                cl.send(response_str.encode())
+                cl.close()
+                
+            except Exception as e:
+                print('Error in connection handler:', e)
+                try:
+                    cl.close()
+                except:
+                    pass
+                time.sleep(0.1)
+    finally:
+        timer.deinit()
+        s.close()
+        print("Server socket closed")
 
 def connect_wifi():
     print("Connecting to WiFi...")
@@ -103,7 +178,6 @@ def connect_wifi():
     wlan.active(True)
     wlan.connect(WIFI_SSID, WIFI_PASSWORD)
     
-    # Wait for connection
     max_wait = 10
     while max_wait > 0:
         if wlan.status() < 0 or wlan.status() >= 3:
@@ -119,52 +193,6 @@ def connect_wifi():
         status = wlan.ifconfig()
         print('IP:', status[0])
         return status[0]
-
-def start_webserver(ip, scanner):
-    print("Starting web server...")
-    addr = socket.getaddrinfo(ip, HTTP_PORT)[0][-1]
-    s = socket.socket()
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    
-    try:
-        s.bind(addr)
-        s.listen(1)
-        print(f'Listening on http://{ip}:{HTTP_PORT}')
-        
-        # Initialize LED state
-        led.value(0)  # Start with LED off
-        
-        while True:
-            try:
-                # Handle web requests
-                cl, addr = s.accept()
-                request = cl.recv(1024).decode()
-                
-                if 'GET' in request:
-                    response = {
-                        'temperature': scanner.latest_data['temperature'] if scanner.latest_data else None,
-                        'humidity': scanner.latest_data['humidity'] if scanner.latest_data else None,
-                        'pressure': scanner.latest_data['pressure'] if scanner.latest_data else None
-                    }
-                    
-                    response_json = json.dumps(response)
-                    response_str = f'HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(response_json)}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{response_json}'
-                    
-                    cl.send(response_str.encode())
-                
-                cl.close()
-                
-            except Exception as e:
-                print('Error in connection handler:', e)
-                try:
-                    cl.close()
-                except:
-                    pass
-                time.sleep(0.1)
-    finally:
-        timer.deinit()  # Clean up timer when done
-        s.close()
-        print("Server socket closed")
 
 def ble_scan_timer(timer):
     print("Starting periodic BLE scan...")
@@ -183,7 +211,7 @@ def main():
         time.sleep(1)  # Give time for initial scan
         
         # Setup periodic BLE scanning
-        ble_timer.init(period=30000, mode=Timer.PERIODIC, callback=ble_scan_timer)
+        ble_timer.init(period=60000, mode=Timer.PERIODIC, callback=ble_scan_timer)
         
         # Then connect to WiFi and start web server
         ip = connect_wifi()
