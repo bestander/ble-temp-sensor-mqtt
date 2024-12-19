@@ -49,31 +49,23 @@ This project uses a Raspberry Pi Pico W to read temperature data from Qingping a
 3. Note the MAC addresses and update `config.py`
 
 ### 3. Homebridge Setup
-1. Install the homebridge-http-temperature plugin
+1. Install the homebridge-http-temperature-humidity plugin
 2. Add this to your Homebridge config for each sensor:
    ```json
    {
        "accessories": [
-           {
-               "accessory": "HttpTemperature",
-               "name": "Qingping Sensor",
-               "getUrl": "http://YOUR_PICO_IP:8000/1",
-               "httpMethod": "GET",
-               "temperatureKey": "temperature",
-               "humidity": true,
-               "humidityKey": "humidity",
-               "updateInterval": 60000
-           },
-           {
-               "accessory": "HttpTemperature",
-               "name": "Ruuvi Tag",
-               "getUrl": "http://YOUR_PICO_IP:8000/2",
-               "httpMethod": "GET",
-               "temperatureKey": "temperature",
-               "humidity": true,
-               "humidityKey": "humidity",
-               "updateInterval": 60000
-           }
+                {
+            "accessory": "HttpTemphum",
+            "name": "QingPing",
+            "url": "http://YOUR_PICO_IP:8000/1",
+            "http_method": "GET"
+        },
+        {
+            "accessory": "HttpTemphum",
+            "name": "Ruuvi tag",
+            "url": "http://YOUR_PICO_IP:8000/2",
+            "http_method": "GET"
+        }          
        ]
    }
    ```
