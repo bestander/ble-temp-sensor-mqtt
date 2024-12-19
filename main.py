@@ -5,10 +5,7 @@ import json
 from machine import Pin
 import bluetooth
 from micropython import const
-from config import *  # Import settings from config.py
-
-# Add LED setup
-led = Pin("LED", Pin.OUT)  # Built-in LED on Pico W
+from config import *
 
 # BLE Scanner setup
 _IRQ_SCAN_RESULT = const(5)
@@ -20,10 +17,6 @@ RUUVI_DATA_FORMAT = 5  # Ruuvi uses data format 5
 # HTTP server settings
 HTTP_PORT = 8000
 
-# Add LED blink function
-def blink_led():
-    led.toggle()
-
 class BLEScanner:
     def __init__(self):
         print("Initializing BLE Scanner...")
@@ -31,7 +24,6 @@ class BLEScanner:
         self.ble.active(True)
         self.ble.irq(self.ble_irq)
         self.latest_data = None
-        self.data_received = False  # Add flag for new data
         print("BLE Scanner initialized and active")
         
     def ble_irq(self, event, data):
@@ -73,7 +65,6 @@ class BLEScanner:
                                     'pressure': pressure / 100
                                 }
                                 print(f"Parsed data: {self.latest_data}")
-                                self.data_received = True  # Set flag when new data received
                                 return
                 i += length + 1
             print("No Ruuvi data found in packet")
@@ -118,56 +109,36 @@ def start_webserver(ip, scanner):
         s.listen(1)
         print(f'Listening on http://{ip}:{HTTP_PORT}')
         
-        last_blink = time.ticks_ms()
-        blink_interval = 1000  # Start with 1 second interval
         while True:
             try:
-                # Adjust blink interval based on data state
-                current_time = time.ticks_ms()
-                if scanner.data_received:
-                    blink_interval = 500  # Blink every 0.5 seconds when data received
+                print("Waiting for connection...")
+                cl, addr = s.accept()
+                print('Client connected from', addr)
+                request = cl.recv(1024).decode()
+                print(f"Received request: {request}")
+                
+                print("Starting new BLE scan")
+                scanner.start_scan()
+                time.sleep(1)  # Give some time for scanning
+                
+                if scanner.latest_data:
+                    print(f"Sending data: {scanner.latest_data}")
                 else:
-                    blink_interval = 1000  # Normal 1 second blink
-
-                if time.ticks_diff(current_time, last_blink) >= blink_interval:
-                    blink_led()
-                    last_blink = current_time
-
-                # Check for socket data with timeout
-                s.settimeout(0.1)  # 100ms timeout
-                try:
-                    cl, addr = s.accept()
-                    print('Client connected from', addr)
-                    request = cl.recv(1024).decode()
-                    print(f"Received request: {request}")
-                    
-                    print("Starting new BLE scan")
-                    scanner.start_scan()
-                    time.sleep(1)  # Give some time for scanning
-                    
-                    if scanner.latest_data:
-                        print(f"Sending data: {scanner.latest_data}")
-                    else:
-                        print("No data available from Ruuvi tag")
-                    
-                    response = {
-                        'temperature': scanner.latest_data['temperature'] if scanner.latest_data else None,
-                        'humidity': scanner.latest_data['humidity'] if scanner.latest_data else None,
-                        'pressure': scanner.latest_data['pressure'] if scanner.latest_data else None
-                    }
-                    
-                    response_json = json.dumps(response)
-                    response_str = f'HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(response_json)}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{response_json}'
-                    
-                    print(f"Sending response: {response_str}")
-                    cl.send(response_str.encode())
-                    cl.close()
-                    scanner.data_received = False  # Reset flag after handling request
-                except OSError as e:
-                    if e.args[0] == 11:  # EAGAIN error (timeout)
-                        continue
-                    raise e
-                    
+                    print("No data available from Ruuvi tag")
+                
+                response = {
+                    'temperature': scanner.latest_data['temperature'] if scanner.latest_data else None,
+                    'humidity': scanner.latest_data['humidity'] if scanner.latest_data else None,
+                    'pressure': scanner.latest_data['pressure'] if scanner.latest_data else None
+                }
+                
+                response_json = json.dumps(response)
+                response_str = f'HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(response_json)}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{response_json}'
+                
+                print(f"Sending response: {response_str}")
+                cl.send(response_str.encode())
+                cl.close()
+                
             except Exception as e:
                 print('Error in connection handler:', e)
                 try:
