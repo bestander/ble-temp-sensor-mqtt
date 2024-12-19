@@ -31,6 +31,10 @@ def blink_timer(timer):
 timer = Timer()
 timer.init(period=1000, mode=Timer.PERIODIC, callback=blink_timer)
 
+# Add a second timer for BLE scanning
+ble_timer = Timer()
+global_scanner = None  # Global variable to store scanner instance
+
 class BLEScanner:
     def __init__(self):
         print("Initializing BLE Scanner...")
@@ -162,23 +166,35 @@ def start_webserver(ip, scanner):
         s.close()
         print("Server socket closed")
 
+def ble_scan_timer(timer):
+    print("Starting periodic BLE scan...")
+    global global_scanner
+    if global_scanner:
+        global_scanner.start_scan()
+
 def main():
     print("Starting main program...")
     try:
         # Initialize BLE scanner first
-        scanner = BLEScanner()
+        global global_scanner
+        global_scanner = BLEScanner()
         print("Starting initial BLE scan...")
-        scanner.start_scan()
+        global_scanner.start_scan()
         time.sleep(1)  # Give time for initial scan
+        
+        # Setup periodic BLE scanning
+        ble_timer.init(period=30000, mode=Timer.PERIODIC, callback=ble_scan_timer)
         
         # Then connect to WiFi and start web server
         ip = connect_wifi()
-        start_webserver(ip, scanner)
+        start_webserver(ip, global_scanner)
     except KeyboardInterrupt:
         print("Program terminated by user")
     except Exception as e:
         print(f"Error in main: {e}")
         raise e
+    finally:
+        ble_timer.deinit()  # Clean up BLE timer
 
 if __name__ == '__main__':
     print("Program starting...")
