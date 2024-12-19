@@ -2,10 +2,14 @@ import network
 import socket
 import time
 import json
-from machine import Pin
+from machine import Pin, Timer
 import bluetooth
 from micropython import const
 from config import *
+
+# LED setup
+led = Pin("LED", Pin.OUT)
+led_state = False
 
 # BLE Scanner setup
 _IRQ_SCAN_RESULT = const(5)
@@ -16,6 +20,16 @@ RUUVI_DATA_FORMAT = 5  # Ruuvi uses data format 5
 
 # HTTP server settings
 HTTP_PORT = 8000
+
+# Timer for LED blinking
+def blink_timer(timer):
+    global led_state
+    led_state = not led_state
+    led.value(led_state)
+
+# Create timer for LED blinking
+timer = Timer()
+timer.init(period=1000, mode=Timer.PERIODIC, callback=blink_timer)
 
 class BLEScanner:
     def __init__(self):
@@ -33,9 +47,13 @@ class BLEScanner:
             if addr.lower() == RUUVI_MAC.lower():
                 print(f"Found Ruuvi tag! Raw data: {adv_data.hex()}")
                 self.parse_ruuvi_data(adv_data)
+                # Change to fast blinking when data received
+                timer.init(period=500, mode=Timer.PERIODIC, callback=blink_timer)
         elif event == _IRQ_SCAN_DONE:
             print("Scan complete")
-                
+            # Return to normal blinking after scan
+            timer.init(period=1000, mode=Timer.PERIODIC, callback=blink_timer)
+    
     def parse_ruuvi_data(self, data):
         print(f"Parsing data: {data.hex()}")
         try:
@@ -109,34 +127,27 @@ def start_webserver(ip, scanner):
         s.listen(1)
         print(f'Listening on http://{ip}:{HTTP_PORT}')
         
+        # Initialize LED state
+        led.value(0)  # Start with LED off
+        
         while True:
             try:
-                print("Waiting for connection...")
+                # Handle web requests
                 cl, addr = s.accept()
-                print('Client connected from', addr)
                 request = cl.recv(1024).decode()
-                print(f"Received request: {request}")
                 
-                print("Starting new BLE scan")
-                scanner.start_scan()
-                time.sleep(1)  # Give some time for scanning
+                if 'GET' in request:
+                    response = {
+                        'temperature': scanner.latest_data['temperature'] if scanner.latest_data else None,
+                        'humidity': scanner.latest_data['humidity'] if scanner.latest_data else None,
+                        'pressure': scanner.latest_data['pressure'] if scanner.latest_data else None
+                    }
+                    
+                    response_json = json.dumps(response)
+                    response_str = f'HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(response_json)}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{response_json}'
+                    
+                    cl.send(response_str.encode())
                 
-                if scanner.latest_data:
-                    print(f"Sending data: {scanner.latest_data}")
-                else:
-                    print("No data available from Ruuvi tag")
-                
-                response = {
-                    'temperature': scanner.latest_data['temperature'] if scanner.latest_data else None,
-                    'humidity': scanner.latest_data['humidity'] if scanner.latest_data else None,
-                    'pressure': scanner.latest_data['pressure'] if scanner.latest_data else None
-                }
-                
-                response_json = json.dumps(response)
-                response_str = f'HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(response_json)}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{response_json}'
-                
-                print(f"Sending response: {response_str}")
-                cl.send(response_str.encode())
                 cl.close()
                 
             except Exception as e:
@@ -145,14 +156,22 @@ def start_webserver(ip, scanner):
                     cl.close()
                 except:
                     pass
+                time.sleep(0.1)
     finally:
+        timer.deinit()  # Clean up timer when done
         s.close()
         print("Server socket closed")
 
 def main():
     print("Starting main program...")
     try:
+        # Initialize BLE scanner first
         scanner = BLEScanner()
+        print("Starting initial BLE scan...")
+        scanner.start_scan()
+        time.sleep(1)  # Give time for initial scan
+        
+        # Then connect to WiFi and start web server
         ip = connect_wifi()
         start_webserver(ip, scanner)
     except KeyboardInterrupt:
