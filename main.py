@@ -42,17 +42,65 @@ class BLEScanner:
         self.ble = bluetooth.BLE()
         self.ble.active(True)
         self.ble.irq(self.ble_irq)
-        self.mqtt_client = MQTTClient(
-            MQTT_CLIENT_ID,
-            MQTT_BROKER,
-            port=MQTT_PORT,
-            user=MQTT_USERNAME,
-            password=MQTT_PASSWORD
-        )
-        self.mqtt_client.connect()
-        print("Connected to MQTT broker")
+        self.mqtt_client = None
+        self.mqtt_connected = False
+        self.connect_mqtt()
         self.devices_seen_this_scan = set()  # Track devices seen during current scan
         print("BLE Scanner initialized and active")
+
+    def connect_mqtt(self):
+        """Connect or reconnect to MQTT broker with retry logic"""
+        max_retries = 5
+        retry_count = 0
+        
+        while retry_count < max_retries:
+            try:
+                print(f"Attempting MQTT connection (attempt {retry_count + 1}/{max_retries})...")
+                self.mqtt_client = MQTTClient(
+                    MQTT_CLIENT_ID,
+                    MQTT_BROKER,
+                    port=MQTT_PORT,
+                    user=MQTT_USERNAME,
+                    password=MQTT_PASSWORD
+                )
+                self.mqtt_client.connect()
+                self.mqtt_connected = True
+                print("Connected to MQTT broker")
+                return True
+            except Exception as e:
+                retry_count += 1
+                print(f"MQTT connection failed: {e}")
+                if retry_count < max_retries:
+                    print(f"Retrying in 5 seconds...")
+                    time.sleep(5)
+                else:
+                    print("Max MQTT connection retries reached")
+                    self.mqtt_connected = False
+                    return False
+
+    def publish_mqtt(self, topic, payload):
+        """Publish to MQTT with automatic reconnection"""
+        if not self.mqtt_connected:
+            print("MQTT not connected, attempting reconnection...")
+            if not self.connect_mqtt():
+                print("Failed to reconnect to MQTT, skipping publish")
+                return False
+        
+        try:
+            self.mqtt_client.publish(topic, payload)
+            return True
+        except Exception as e:
+            print(f"MQTT publish failed: {e}")
+            self.mqtt_connected = False
+            # Try to reconnect and publish again
+            if self.connect_mqtt():
+                try:
+                    self.mqtt_client.publish(topic, payload)
+                    return True
+                except Exception as e2:
+                    print(f"MQTT publish failed after reconnection: {e2}")
+                    return False
+            return False
 
     def ble_irq(self, event, data):
         if event == _IRQ_SCAN_RESULT:
@@ -69,9 +117,11 @@ class BLEScanner:
                 if qingping_data:
                     import json
                     payload = json.dumps(qingping_data)
-                    self.mqtt_client.publish(MQTT_QINGPING_TOPIC, payload)
-                    print("Published Qingping data:", payload)
-                    timer.init(period=500, mode=Timer.PERIODIC, callback=blink_timer)
+                    if self.publish_mqtt(MQTT_QINGPING_TOPIC, payload):
+                        print("Published Qingping data:", payload)
+                        timer.init(period=500, mode=Timer.PERIODIC, callback=blink_timer)
+                    else:
+                        print("Failed to publish Qingping data")
 
             elif addr_str == RUUVI_MAC:
                 self.devices_seen_this_scan.add(addr_str)  # Mark as seen
@@ -79,9 +129,11 @@ class BLEScanner:
                 if ruuvi_data:
                     import json
                     payload = json.dumps(ruuvi_data)
-                    self.mqtt_client.publish(MQTT_RUUVI_TOPIC, payload)
-                    print("Published Ruuvi data:", payload)
-                    timer.init(period=500, mode=Timer.PERIODIC, callback=blink_timer)
+                    if self.publish_mqtt(MQTT_RUUVI_TOPIC, payload):
+                        print("Published Ruuvi data:", payload)
+                        timer.init(period=500, mode=Timer.PERIODIC, callback=blink_timer)
+                    else:
+                        print("Failed to publish Ruuvi data")
 
         elif event == _IRQ_SCAN_DONE:
             print("Scan complete")
@@ -139,6 +191,16 @@ class BLEScanner:
         print("Starting BLE scan...")
         self.ble.gap_scan(10000, 30000, 30000)
 
+    def cleanup(self):
+        """Clean up MQTT connection"""
+        if self.mqtt_connected and self.mqtt_client:
+            try:
+                self.mqtt_client.disconnect()
+                print("MQTT disconnected cleanly")
+            except:
+                pass
+            self.mqtt_connected = False
+
 def connect_wifi():
     print("Connecting to WiFi...")
     wlan = network.WLAN(network.STA_IF)
@@ -190,6 +252,8 @@ def main():
         print(f"Error in main: {e}")
         raise e
     finally:
+        if global_scanner:
+            global_scanner.cleanup()  # Clean up MQTT connection
         ble_timer.deinit()  # Clean up BLE timer
         timer.deinit()  # Clean up LED timer
 
