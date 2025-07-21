@@ -1,5 +1,3 @@
-print("STARTING1112...")
-
 import network
 
 import time
