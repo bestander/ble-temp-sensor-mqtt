@@ -1,11 +1,13 @@
+print("STARTING1112...")
+
 import network
-import socket
+
 import time
-import json
 from machine import Pin, Timer
 import bluetooth
 from micropython import const
-from config import WIFI_SSID, WIFI_PASSWORD, QINGPING_MAC, RUUVI_MAC
+from umqtt.simple import MQTTClient
+from config import WIFI_SSID, WIFI_PASSWORD, QINGPING_MAC, RUUVI_MAC, MQTT_BROKER, MQTT_USERNAME, MQTT_PASSWORD, MQTT_PORT
 
 # LED setup
 led = Pin("LED", Pin.OUT)
@@ -17,8 +19,10 @@ _IRQ_SCAN_DONE = const(6)
 _QINGPING_UUID = const(0xFDCD)
 _RUUVI_COMPANY_ID = const(0x0499)
 
-# HTTP server settings
-HTTP_PORT = 8000
+# MQTT settings
+MQTT_CLIENT_ID = "pico_ble_scanner"
+MQTT_QINGPING_TOPIC = "homeassistant/sensor/qingping"
+MQTT_RUUVI_TOPIC = "homeassistant/sensor/ruuvi"
 
 # Timer for LED blinking
 def blink_timer(timer):
@@ -40,39 +44,52 @@ class BLEScanner:
         self.ble = bluetooth.BLE()
         self.ble.active(True)
         self.ble.irq(self.ble_irq)
-        self.qingping_data = None
-        self.ruuvi_data = None
-        self.last_qingping_update = 0
-        self.last_ruuvi_update = 0
+        self.mqtt_client = MQTTClient(
+            MQTT_CLIENT_ID,
+            MQTT_BROKER,
+            port=MQTT_PORT,
+            user=MQTT_USERNAME,
+            password=MQTT_PASSWORD
+        )
+        self.mqtt_client.connect()
+        print("Connected to MQTT broker")
         self.devices_seen_this_scan = set()  # Track devices seen during current scan
         print("BLE Scanner initialized and active")
-        
+
     def ble_irq(self, event, data):
         if event == _IRQ_SCAN_RESULT:
             addr_type, addr, adv_type, rssi, adv_data = data
             addr_str = ':'.join(['%02x' % i for i in addr])
-            
+
             # Skip if we've already seen this device in this scan
             if addr_str in self.devices_seen_this_scan:
                 return
-            
+
             if addr_str == QINGPING_MAC:
                 self.devices_seen_this_scan.add(addr_str)  # Mark as seen
-                self.parse_qingping_data(adv_data)
-                print("Qingping data updated:", self.qingping_data)
-                timer.init(period=500, mode=Timer.PERIODIC, callback=blink_timer)
-            
+                qingping_data = self.parse_qingping_data(adv_data)
+                if qingping_data:
+                    import json
+                    payload = json.dumps(qingping_data)
+                    self.mqtt_client.publish(MQTT_QINGPING_TOPIC, payload)
+                    print("Published Qingping data:", payload)
+                    timer.init(period=500, mode=Timer.PERIODIC, callback=blink_timer)
+
             elif addr_str == RUUVI_MAC:
                 self.devices_seen_this_scan.add(addr_str)  # Mark as seen
-                self.parse_ruuvi_data(adv_data)
-                print("Ruuvi data updated:", self.ruuvi_data)
-                timer.init(period=500, mode=Timer.PERIODIC, callback=blink_timer)
-                
+                ruuvi_data = self.parse_ruuvi_data(adv_data)
+                if ruuvi_data:
+                    import json
+                    payload = json.dumps(ruuvi_data)
+                    self.mqtt_client.publish(MQTT_RUUVI_TOPIC, payload)
+                    print("Published Ruuvi data:", payload)
+                    timer.init(period=500, mode=Timer.PERIODIC, callback=blink_timer)
+
         elif event == _IRQ_SCAN_DONE:
             print("Scan complete")
             self.devices_seen_this_scan.clear()  # Clear the set for next scan
             timer.init(period=1000, mode=Timer.PERIODIC, callback=blink_timer)
-    
+
     def parse_qingping_data(self, adv_data):
         i = 0
         while i < len(adv_data):
@@ -86,16 +103,14 @@ class BLEScanner:
                         if len(service_data) >= 14:
                             temp_raw = int.from_bytes(service_data[10:12], 'little')
                             temp = temp_raw / 10.0
-                            
                             hum_raw = int.from_bytes(service_data[12:14], 'little')
                             humidity = hum_raw / 10.0
-                            
-                            self.qingping_data = {
+                            return {
                                 'temperature': temp,
                                 'humidity': humidity
                             }
-                            return
             i += length + 1
+        return None
 
     def parse_ruuvi_data(self, adv_data):
         i = 0
@@ -109,75 +124,29 @@ class BLEScanner:
                         mfg_data = adv_data[i + 2:i + length + 1]
                         if len(mfg_data) > 2 and mfg_data[2] == 0x05:  # Data format 5
                             temp_raw = int.from_bytes(mfg_data[3:5], 'big', True)
-                            temp = temp_raw * 0.005
-                            
+                            temp = temp_raw * 0.10
                             hum_raw = int.from_bytes(mfg_data[5:7], 'big')
                             humidity = hum_raw * 0.0025
-                            
                             pressure_raw = int.from_bytes(mfg_data[7:9], 'big')
                             pressure = (pressure_raw + 50000) / 100
-                            
-                            self.ruuvi_data = {
+                            return {
                                 'temperature': round(temp, 2),
                                 'humidity': round(humidity, 2),
                                 'pressure': round(pressure, 2)
                             }
-                            return
             i += length + 1
-    
+        return None
+
     def start_scan(self):
         print("Starting BLE scan...")
         self.ble.gap_scan(10000, 30000, 30000)
-
-def start_webserver(ip, scanner):
-    print("Starting web server...")
-    addr = socket.getaddrinfo(ip, HTTP_PORT)[0][-1]
-    s = socket.socket()
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    
-    try:
-        s.bind(addr)
-        s.listen(1)
-        print(f'Listening on http://{ip}:{HTTP_PORT}')
-        
-        while True:
-            try:
-                cl, addr = s.accept()
-                request = cl.recv(1024).decode()
-                
-                response = None
-                if 'GET /1' in request:  # Qingping endpoint
-                    response = scanner.qingping_data
-                elif 'GET /2' in request:  # Ruuvi endpoint
-                    response = scanner.ruuvi_data
-                
-                if response:
-                    response_json = json.dumps(response)
-                    response_str = f'HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(response_json)}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{response_json}'
-                else:
-                    response_str = 'HTTP/1.0 404 Not Found\r\n\r\n'
-                
-                cl.send(response_str.encode())
-                cl.close()
-                
-            except Exception as e:
-                print('Error in connection handler:', e)
-                try:
-                    cl.close()
-                except:
-                    pass
-                time.sleep(0.1)
-    finally:
-        timer.deinit()
-        s.close()
-        print("Server socket closed")
 
 def connect_wifi():
     print("Connecting to WiFi...")
     wlan = network.WLAN(network.STA_IF)
     wlan.active(True)
     wlan.connect(WIFI_SSID, WIFI_PASSWORD)
-    
+
     max_wait = 10
     while max_wait > 0:
         if wlan.status() < 0 or wlan.status() >= 3:
@@ -185,7 +154,7 @@ def connect_wifi():
         max_wait -= 1
         print('Waiting for connection...')
         time.sleep(1)
-    
+
     if wlan.status() != 3:
         raise RuntimeError('Network connection failed')
     else:
@@ -203,19 +172,20 @@ def ble_scan_timer(timer):
 def main():
     print("Starting main program...")
     try:
-        # Initialize BLE scanner first
+        # Initialize BLE scanner
         global global_scanner
         global_scanner = BLEScanner()
         print("Starting initial BLE scan...")
         global_scanner.start_scan()
         time.sleep(1)  # Give time for initial scan
-        
+
         # Setup periodic BLE scanning
         ble_timer.init(period=60000, mode=Timer.PERIODIC, callback=ble_scan_timer)
-        
-        # Then connect to WiFi and start web server
-        ip = connect_wifi()
-        start_webserver(ip, global_scanner)
+
+        # Keep program running
+        while True:
+            time.sleep(1)
+
     except KeyboardInterrupt:
         print("Program terminated by user")
     except Exception as e:
@@ -223,7 +193,9 @@ def main():
         raise e
     finally:
         ble_timer.deinit()  # Clean up BLE timer
+        timer.deinit()  # Clean up LED timer
 
 if __name__ == '__main__':
     print("Program starting...")
+    connect_wifi()  # Connect to WiFi first
     main()
