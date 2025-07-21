@@ -124,7 +124,7 @@ class BLEScanner:
                         mfg_data = adv_data[i + 2:i + length + 1]
                         if len(mfg_data) > 2 and mfg_data[2] == 0x05:  # Data format 5
                             temp_raw = int.from_bytes(mfg_data[3:5], 'big', True)
-                            temp = temp_raw * 0.10
+                            temp = temp_raw * 0.005
                             hum_raw = int.from_bytes(mfg_data[5:7], 'big')
                             humidity = hum_raw * 0.0025
                             pressure_raw = int.from_bytes(mfg_data[7:9], 'big')
