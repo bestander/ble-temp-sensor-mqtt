@@ -44,6 +44,7 @@ class BLEScanner:
         self.ble.irq(self.ble_irq)
         self.mqtt_client = None
         self.mqtt_connected = False
+        self.wlan = None
         self.connect_mqtt()
         self.devices_seen_this_scan = set()  # Track devices seen during current scan
         print("BLE Scanner initialized and active")
@@ -78,8 +79,55 @@ class BLEScanner:
                     self.mqtt_connected = False
                     return False
 
+    def check_wifi_connection(self):
+        """Check if WiFi is still connected"""
+        if not self.wlan:
+            self.wlan = network.WLAN(network.STA_IF)
+        return self.wlan.status() == 3
+
+    def connect_wifi(self):
+        """Connect or reconnect to WiFi"""
+        print("Connecting to WiFi...")
+        if not self.wlan:
+            self.wlan = network.WLAN(network.STA_IF)
+        
+        self.wlan.active(True)
+        
+        # If already connected, no need to reconnect
+        if self.wlan.status() == 3:
+            print("WiFi already connected")
+            return True
+            
+        self.wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+
+        max_wait = 10
+        while max_wait > 0:
+            if self.wlan.status() < 0 or self.wlan.status() >= 3:
+                break
+            max_wait -= 1
+            print('Waiting for WiFi connection...')
+            time.sleep(1)
+
+        if self.wlan.status() != 3:
+            print('WiFi connection failed')
+            return False
+        else:
+            print('WiFi Connected')
+            status = self.wlan.ifconfig()
+            print('IP:', status[0])
+            return True
+
     def publish_mqtt(self, topic, payload):
-        """Publish to MQTT with automatic reconnection"""
+        """Publish to MQTT with automatic WiFi and MQTT reconnection"""
+        # First check WiFi connection and reconnect if needed
+        if not self.check_wifi_connection():
+            print("WiFi disconnected, attempting reconnection...")
+            if not self.connect_wifi():
+                print("Failed to reconnect WiFi, skipping publish")
+                return False
+            # WiFi reconnected, need to reconnect MQTT too
+            self.mqtt_connected = False
+        
         if not self.mqtt_connected:
             print("MQTT not connected, attempting reconnection...")
             if not self.connect_mqtt():
@@ -201,28 +249,6 @@ class BLEScanner:
                 pass
             self.mqtt_connected = False
 
-def connect_wifi():
-    print("Connecting to WiFi...")
-    wlan = network.WLAN(network.STA_IF)
-    wlan.active(True)
-    wlan.connect(WIFI_SSID, WIFI_PASSWORD)
-
-    max_wait = 10
-    while max_wait > 0:
-        if wlan.status() < 0 or wlan.status() >= 3:
-            break
-        max_wait -= 1
-        print('Waiting for connection...')
-        time.sleep(1)
-
-    if wlan.status() != 3:
-        raise RuntimeError('Network connection failed')
-    else:
-        print('Connected')
-        status = wlan.ifconfig()
-        print('IP:', status[0])
-        return status[0]
-
 def ble_scan_timer(timer):
     print("Starting periodic BLE scan...")
     global global_scanner
@@ -232,9 +258,32 @@ def ble_scan_timer(timer):
 def main():
     print("Starting main program...")
     try:
-        # Initialize BLE scanner
+        # Connect to WiFi first
+        print("Initial WiFi connection...")
+        wlan = network.WLAN(network.STA_IF)
+        wlan.active(True)
+        wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+
+        max_wait = 10
+        while max_wait > 0:
+            if wlan.status() < 0 or wlan.status() >= 3:
+                break
+            max_wait -= 1
+            print('Waiting for connection...')
+            time.sleep(1)
+
+        if wlan.status() != 3:
+            raise RuntimeError('Initial network connection failed')
+        else:
+            print('Connected')
+            status = wlan.ifconfig()
+            print('IP:', status[0])
+
+        # Initialize BLE scanner (it will handle WiFi reconnections internally)
         global global_scanner
         global_scanner = BLEScanner()
+        global_scanner.wlan = wlan  # Pass the WiFi connection object
+        
         print("Starting initial BLE scan...")
         global_scanner.start_scan()
         time.sleep(1)  # Give time for initial scan
@@ -259,5 +308,4 @@ def main():
 
 if __name__ == '__main__':
     print("Program starting...")
-    connect_wifi()  # Connect to WiFi first
     main()
